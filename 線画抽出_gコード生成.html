@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>線画抽出アプリ + Gコード生成</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            text-align: center;
+            padding: 20px;
+        }
+        canvas {
+            margin-top: 10px;
+            border: 1px solid #ccc;
+        }
+        .slider-container {
+            margin: 10px 0;
+        }
+        label {
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>線画抽出アプリ + Gコード生成</h1>
+    <input type="file" id="fileInput" accept="image/*"><br>
+    <div class="slider-container">
+        <label for="threshold1">しきい値1 (低):</label>
+        <input type="range" id="threshold1" min="0" max="255" value="50">
+        <span id="value1">50</span>
+        <br>
+        <label for="threshold2">しきい値2 (高):</label>
+        <input type="range" id="threshold2" min="0" max="255" value="150">
+        <span id="value2">150</span>
+        <br>
+        <label for="areaThreshold">最小輪郭面積:</label>
+        <input type="range" id="areaThreshold" min="0" max="30" value="5">
+        <span id="areaValue">5</span>
+    </div>
+    <label><input type="checkbox" id="smoothingToggle" checked> 線をきれいにする</label><br>
+    <button id="exportBtn" disabled>Gコードを保存</button>
+    <button id="previewBtn" disabled>Gコードプレビュー</button>
+    <br>
+    <canvas id="canvas"></canvas>
+    <h3>Gコードプレビュー:</h3>
+    <canvas id="previewCanvas" width="500" height="500"></canvas>
+
+    <script src="https://docs.opencv.org/4.5.5/opencv.js"></script>
+    <script>
+        let imgElement = null;
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d');
+        let previewCanvas = document.getElementById('previewCanvas');
+        let previewCtx = previewCanvas.getContext('2d');
+        let exportBtn = document.getElementById('exportBtn');
+        let previewBtn = document.getElementById('previewBtn');
+        let smoothingToggle = document.getElementById('smoothingToggle');
+        let contours = null;
+        let srcImage = null;
+        let gcodeData = "";
+
+        const threshold1Input = document.getElementById('threshold1');
+        const threshold2Input = document.getElementById('threshold2');
+        const value1Display = document.getElementById('value1');
+        const value2Display = document.getElementById('value2');
+        const areaThresholdInput = document.getElementById('areaThreshold');
+        const areaValueDisplay = document.getElementById('areaValue');
+
+        threshold1Input.oninput = () => {
+            value1Display.textContent = threshold1Input.value;
+            if (srcImage) processImage();
+        };
+        threshold2Input.oninput = () => {
+            value2Display.textContent = threshold2Input.value;
+            if (srcImage) processImage();
+        };
+        areaThresholdInput.oninput = () => {
+            areaValueDisplay.textContent = areaThresholdInput.value;
+            if (srcImage) processImage();
+        };
+
+        cv['onRuntimeInitialized'] = () => {
+            console.log('OpenCV.js is ready!');
+        };
+
+        document.getElementById('fileInput').addEventListener('change', (e) => {
+            let file = e.target.files[0];
+            if (!file) return;
+
+            let reader = new FileReader();
+            reader.onload = function(event) {
+                imgElement = new Image();
+                imgElement.onload = function() {
+                    canvas.width = imgElement.width;
+                    canvas.height = imgElement.height;
+                    ctx.drawImage(imgElement, 0, 0);
+                    if (srcImage) srcImage.delete();
+                    srcImage = cv.imread(canvas);
+                    processImage();
+                }
+                imgElement.src = event.target.result;
+            }
+            reader.readAsDataURL(file);
+        });
+
+        function processImage() {
+            let gray = new cv.Mat();
+            let blurred = new cv.Mat();
+            let edges = new cv.Mat();
+            contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+
+            cv.cvtColor(srcImage, gray, cv.COLOR_RGBA2GRAY, 0);
+            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+            let t1 = parseInt(threshold1Input.value);
+            let t2 = parseInt(threshold2Input.value);
+            let areaThreshold = parseFloat(areaThresholdInput.value);
+            cv.Canny(blurred, edges, t1, t2);
+            cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let simplifiedContours = new cv.MatVector();
+            for (let i = 0; i < contours.size(); ++i) {
+                let contour = contours.get(i);
+                if (cv.contourArea(contour) < areaThreshold) {
+                    contour.delete();
+                    continue;
+                }
+                if (smoothingToggle.checked) {
+                    let approx = new cv.Mat();
+                    let epsilon = 1.5;
+                    cv.approxPolyDP(contour, approx, epsilon, false);
+                    simplifiedContours.push_back(approx);
+                    contour.delete();
+                } else {
+                    simplifiedContours.push_back(contour);
+                }
+            }
+            contours.delete();
+            contours = simplifiedContours;
+
+            cv.imshow(canvas, edges);
+
+            gray.delete();
+            blurred.delete();
+            edges.delete();
+            hierarchy.delete();
+
+            exportBtn.disabled = false;
+            previewBtn.disabled = false;
+        }
+
+        exportBtn.addEventListener('click', () => {
+            if (!contours) return;
+            let gcode = "G21 ; mm単位\nG90 ; 絶対座標\nG1 F1500\n";
+
+            const MAX_WIDTH = 100;
+            const MAX_HEIGHT = 100;
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+            for (let i = 0; i < contours.size(); ++i) {
+                let cnt = contours.get(i);
+                for (let j = 0; j < cnt.rows; ++j) {
+                    let pt = cnt.intPtr(j);
+                    let x = pt[0], y = pt[1];
+                    minX = Math.min(minX, x);
+                    minY = Math.min(minY, y);
+                    maxX = Math.max(maxX, x);
+                    maxY = Math.max(maxY, y);
+                }
+            }
+
+            let scaleX = MAX_WIDTH / (maxX - minX);
+            let scaleY = MAX_HEIGHT / (maxY - minY);
+            let scale = Math.min(scaleX, scaleY);
+
+            for (let i = 0; i < contours.size(); ++i) {
+                let cnt = contours.get(i);
+                let lastX = null;
+                let lastY = null;
+
+                for (let j = 0; j < cnt.rows; ++j) {
+                    let pt = cnt.intPtr(j);
+                    let x = (pt[0] - minX) * scale;
+                    let y = (pt[1] - minY) * scale;
+
+                    if (smoothingToggle.checked && lastX !== null && lastY !== null) {
+                        let dx = x - lastX;
+                        let dy = y - lastY;
+                        let dist = Math.hypot(dx, dy);
+                        if (dist < 1.0) continue;
+                    }
+
+                    if (j === 0 || lastX === null) {
+                        gcode += `G0 X${x.toFixed(2)} Y${y.toFixed(2)} ; 移動\n`;
+                        gcode += `M3 ; ペンを下げる\n`;
+                    } else {
+                        gcode += `G1 X${x.toFixed(2)} Y${y.toFixed(2)}\n`;
+                    }
+
+                    lastX = x;
+                    lastY = y;
+                }
+                gcode += "M5 ; ペンを上げる\n";
+            }
+
+            gcodeData = gcode;
+
+            let blob = new Blob([gcode], { type: 'text/plain' });
+            let url = URL.createObjectURL(blob);
+            let a = document.createElement('a');
+            a.href = url;
+            a.download = 'drawing.gcode';
+            a.click();
+        });
+
+        previewBtn.addEventListener('click', () => {
+            previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+            let lines = gcodeData.split("\n");
+            let penDown = false;
+            let lastX = null, lastY = null;
+
+            for (let line of lines) {
+                if (line.startsWith("G0") || line.startsWith("G1")) {
+                    let match = line.match(/X(\d+(\.\d+)?)\s+Y(\d+(\.\d+)?)/);
+                    if (match) {
+                        let x = parseFloat(match[1]) * 5;
+                        let y = parseFloat(match[3]) * 5;
+                        if (penDown && lastX !== null && lastY !== null) {
+                            previewCtx.beginPath();
+                            previewCtx.moveTo(lastX, lastY);
+                            previewCtx.lineTo(x, y);
+                            previewCtx.stroke();
+                        }
+                        lastX = x;
+                        lastY = y;
+                    }
+                } else if (line.startsWith("M3")) {
+                    penDown = true;
+                } else if (line.startsWith("M5")) {
+                    penDown = false;
+                    lastX = null;
+                    lastY = null;
+                }
+            }
+        });
+    </script>
+</body>
+</html>
